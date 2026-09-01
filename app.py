@@ -3,21 +3,27 @@ import cups
 from flask import Flask, request, jsonify, render_template_string
 from flask_httpauth import HTTPBasicAuth
 from werkzeug.utils import secure_filename
+import time
+from pypdf import PdfReader
 
 app = Flask(__name__)
 auth = HTTPBasicAuth()
 
 # --- 1. security configurations ---
 # maximum file upload size
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  
+app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024  
 
 # only this formats are allowed
 ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg', 'txt'}
 
 # saving folder for uploaded file
 # Get directory where app.py is located
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, 'tmp', 'cups_uploads')
+# BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# UPLOAD_FOLDER = os.path.join(BASE_DIR, 'tmp', 'cups_uploads')
+UPLOAD_FOLDER = '/tmp/print_buffer'
+
+# Create directory if it doesn't exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
@@ -26,6 +32,14 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 USER_DATA = {
     "admin": "SuperSecurePassword123"
 }
+
+# Helper function to get page count
+def get_page_count(file_path):
+    try:
+        reader = PdfReader(file_path)
+        return len(reader.pages)
+    except Exception:
+        return 1  # Default to 1 page for plain text/images
 
 @auth.verify_password
 def verify_password(username, password):
@@ -125,6 +139,8 @@ def home():
 @app.route('/print', methods=['POST'])
 # @auth.login_required
 def print_document():
+    t_start = time.perf_counter()  # 1. Request arrival
+
     if 'file' not in request.files:
         return jsonify({"error": "No file part"}), 400
     
@@ -141,12 +157,19 @@ def print_document():
         filename = secure_filename(f.filename or 'printjob.pdf')
         file_path = os.path.join(UPLOAD_FOLDER, filename)
 
-        # 2. Save
+        # --- Phase 1: File Ingestion (Network Receive + RAM Disk Save) ---
         try:
             f.save(file_path)
         except Exception as e:
             return jsonify({'error': f'Failed to write file to disk: {str(e)}'}), 500
-        
+
+        t_ingest = time.perf_counter()  # End of Ingestion
+
+        # --- Phase 2: File Parsing & Rendering ---
+        # Optional: Inspect file / count pages here (e.g., using pypdf)
+        # page_count = get_pdf_page_count(file_path)
+        t_render = time.perf_counter()  # End of Rendering/Parsing
+
         # (Path Traversal)
         # filename = secure_filename(file.filename)
         # file_path = os.path.join(UPLOAD_FOLDER, filename)
@@ -154,6 +177,7 @@ def print_document():
 
         file_exists = os.path.exists(file_path)
 
+        # --- Phase 3: Hardware Dispatch via CUPS ---
         if file_exists:
             try:
                 conn = cups.Connection()
@@ -163,22 +187,49 @@ def print_document():
                 if not printer_name:
                     printers = conn.getPrinters()
                     if printers:
-                        printer_name = list(printers.keys())
+                        printer_name = list(printers.keys())[0]
                     else:
                         return jsonify({"error": "No printers found on Linux"}), 500
                 # TODO: We need a function to select idle printer...
 
                 # CUPS
                 # FIX: added index number 0 in printer_name
-                print("Printer selected", printer_name[0])
-                job_id = conn.printFile(printer_name[0], file_path, "Secure Mobile Job", {})
+                print("Printer selected", printer_name)
+                job_id = conn.printFile(printer_name, file_path, "Secure Mobile Job", {})
                 print("Print job is done.", job_id)
+
                 os.remove(file_path)
+
+                t_dispatch = time.perf_counter()  # End of Dispatch
+
+                # Calculate phase durations (in seconds)
+                ingestion_time = t_ingest - t_start
+                rendering_time = t_render - t_ingest
+                dispatch_time = t_dispatch - t_render
+                total_time = t_dispatch - t_start
+
+                print(f"Ingestion: {ingestion_time:.3f}s | "
+                      f"Rendering: {rendering_time:.3f}s | "
+                      f"Dispatch: {dispatch_time:.3f}s | "
+                      f"TOTAL: {total_time:.3f}s")
+
+                # log the result to a file
+                with open("print_log.txt", "a") as f:
+                    f.write(f"Ingestion: {ingestion_time:.3f}s | "
+                            f"Rendering: {rendering_time:.3f}s | "
+                            f"Dispatch: {dispatch_time:.3f}s | "
+                            f"TOTAL: {total_time:.3f}s\n")
                 
                 return jsonify({
                     "message": "Print job sent successfully",
                     "printer": printer_name,
-                    "job_id": job_id
+                    "job_id": job_id,
+                    "latency_breakdown": {
+                        "ingestion_sec": round(ingestion_time, 4),
+                        "rendering_sec": round(rendering_time, 4),
+                        "dispatch_sec": round(dispatch_time, 4),
+                        "total_sec": round(total_time, 4)
+                    }
                 }), 200
                 
             except Exception as e:
@@ -186,7 +237,8 @@ def print_document():
                     os.remove(file_path)
                 return jsonify({"error": f"CUPS Error: {str(e)}"}), 500
         else:
-            return jsonify({"error": f"File does not exists: {str(e)}"}), 500
+            # return jsonify({"error": f"File does not exists: {str(e)}"}), 500
+            return jsonify({"error": "File failed to save to target path."}), 500
 
 # API for getting printers
 @app.route('/get-printers', methods=['GET'])
